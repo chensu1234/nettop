@@ -1,0 +1,730 @@
+#!/bin/bash
+#
+# nettop - Real-time Network Traffic Monitor
+# Author: Chen Su
+# License: MIT
+# Platform: macOS, Linux
+#
+# A lightweight, terminal-based network traffic monitor with an htop-like
+# interface. Real-time bandwidth usage, active connections, per-interface
+# stats, and top talkers — no root privileges required.
+#
+# Usage:
+#   nettop.sh watch              Real-time TUI monitoring
+#   nettop.sh top [N]            Show top bandwidth interfaces
+#   nettop.sh interfaces         List all network interfaces
+#   nettop.sh connections [N]    Show active connections
+#   nettop.sh help               Show help
+#
+
+set -o pipefail
+shopt -s nullglob 2>/dev/null
+
+########################################
+# Version & Metadata
+########################################
+VERSION="1.0.0"
+SNAME="$(basename "$0")"
+
+########################################
+# Default Configuration
+########################################
+REFRESH="${NETTOP_REFRESH:-2}"
+MAX_ROWS="${NETTOP_MAX_ROWS:-10}"
+BWINDOW="${NETTOP_BWINDOW:-3}"
+UNIT_MODE="auto"
+SHOW_BINARY="${NETTOP_BINARY:-0}"
+COLOR_MODE="${NETTOP_COLOR:-1}"
+SORT_BY="${NETTOP_SORT:-rx}"
+
+########################################
+# Paths & State
+########################################
+STATE_DIR="${NETTOP_STATE_DIR:-$PWD/.state}"
+CONFIG_DIR="${NETTOP_CONFIG_DIR:-$PWD/config}"
+STATE_FILE="$STATE_DIR/nettop.prev"
+TMP_DIR=""
+
+########################################
+# OS Detection
+########################################
+is_linux() { [ "$(uname)" = "Linux" ] && return 0 || return 1; }
+is_mac()   { [ "$(uname)" = "Darwin" ] && return 0 || return 1; }
+
+########################################
+# Terminal / Color Setup
+########################################
+_setup_colors() {
+    if [ -t 1 ] && [ "${COLOR_MODE:-1}" != "0" ]; then
+        RED=$'\033[0;31m';   GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+        BLUE=$'\033[0;34m';  CYAN=$'\033[0;36m';  MAGENTA=$'\033[0;35m'
+        DIM=$'\033[2m';      BOLD=$'\033[1m';     WHITE=$'\033[0;37m'
+        BG_RED=$'\033[41m';  BG_GREEN=$'\033[42m'
+        NC=$'\033[0m';       ITALIC=$'\033[3m'
+    else
+        RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''
+        DIM=''; BOLD=''; WHITE=''; BG_RED=''; BG_GREEN=''; NC=''; ITALIC=''
+    fi
+}
+
+p()      { echo -e "${1}${*:2}"; }
+info()   { p "$GREEN[+]$NC" "$*"; }
+warn()   { p "$YELLOW[!]$NC" "$*"; }
+error()  { p "$RED[-]$NC" "$*"; }
+bold()   { p "$BOLD" "$*"; }
+dim()    { p "$DIM" "$*"; }
+section(){ p "$CYAN>>>$NC" "$*"; }
+
+########################################
+# Cleanup
+########################################
+_cleanup() {
+    [ -t 1 ] && printf '\033[?25h\033[0m'
+    [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR" 2>/dev/null
+}
+trap _cleanup EXIT INT TERM
+
+########################################
+# Directory Initialization
+########################################
+_init() {
+    local pid="$$"
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nettop.${pid}.XXXXXX" 2>/dev/null)"
+    [ -z "$TMP_DIR" ] && TMP_DIR="/tmp/nettop.${pid}"
+    mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$TMP_DIR" 2>/dev/null
+}
+
+########################################
+# Format bytes to human-readable
+# $1: bytes (numeric string)
+# $2: mode: auto | b | kb | mb | gb
+########################################
+fmt_bytes() {
+    local bytes="$1" mode="${2:-$UNIT_MODE}"
+    # Validate input
+    [[ "$bytes" =~ ^-?[0-9]+$ ]] || { echo "0"; return; }
+    [ "$bytes" -lt 0 ] && bytes=0
+
+    local base=$([ "${SHOW_BINARY:-0}" = "1" ] && echo 1024 || echo 1000)
+    local kb=$((base))
+    local mb=$((base*base))
+    local gb=$((base*mb))
+    local tb=$((base*gb))
+
+    local result
+    case "$mode" in
+        b)   result=$(printf "%.0f B" "$bytes") ;;
+        kb)  result=$(printf "%.1f KB" "$(echo "scale=1; $bytes/$kb" | bc -l 2>/dev/null || echo 0)") ;;
+        mb)  result=$(printf "%.2f MB" "$(echo "scale=2; $bytes/$mb" | bc -l 2>/dev/null || echo 0)") ;;
+        gb)  result=$(printf "%.2f GB" "$(echo "scale=2; $bytes/$gb" | bc -l 2>/dev/null || echo 0)") ;;
+        auto|"")
+            if   [ "$bytes" -ge $tb ]; then
+                result=$(printf "%.2f TB" "$(echo "scale=2; $bytes/$tb" | bc -l 2>/dev/null || echo 0)")
+            elif [ "$bytes" -ge $gb ]; then
+                result=$(printf "%.2f GB" "$(echo "scale=2; $bytes/$gb" | bc -l 2>/dev/null || echo 0)")
+            elif [ "$bytes" -ge $mb ]; then
+                result=$(printf "%.2f MB" "$(echo "scale=2; $bytes/$mb" | bc -l 2>/dev/null || echo 0)")
+            elif [ "$bytes" -ge $kb ]; then
+                result=$(printf "%.1f KB" "$(echo "scale=1; $bytes/$kb" | bc -l 2>/dev/null || echo 0)")
+            else
+                result="${bytes} B"
+            fi
+            ;;
+    esac
+    echo "$result"
+}
+
+########################################
+# Format rate (bytes/sec)
+########################################
+fmt_rate() {
+    local bps="$1" secs="${2:-1}"
+    [ -z "$secs" ] || [ "$secs" -le 0 ] && secs=1
+    fmt_bytes $(( bps / secs )) "auto"
+}
+
+########################################
+# Color-coded rate display
+########################################
+color_rate() {
+    local bps="$1"
+    local div=$([ "${SHOW_BINARY:-0}" = "1" ] && echo 1024 || echo 1000)
+    local kbs=$(( 10 * div ))  # 10 KB/s → yellow
+    local mbs=$(( 100 * div )) # 100 KB/s → red
+    local formatted; formatted="$(fmt_rate "$bps")"
+    if   [ "$bps" -ge "$mbs" ]; then
+        p "$RED" "$formatted/s"
+    elif [ "$bps" -ge "$kbs" ]; then
+        p "$YELLOW" "$formatted/s"
+    else
+        p "$GREEN" "$formatted/s"
+    fi
+}
+
+########################################
+# Pad/truncate string
+########################################
+pad()   { printf "%-${2}s" "${1:0:$2}"; }
+trunc() { local s="$1" w="$2"; printf "%.${w}s" "$s"; [ ${#s} -gt "$w" ] && echo -n "…"; }
+
+########################################
+# Timestamp
+########################################
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+########################################
+# Terminal dimensions
+########################################
+tty_size() {
+    if is_linux && [ -e /dev/tty ]; then
+        local sz; sz=$(stty size 2>/dev/null); echo "${sz:-24 80}"
+    else
+        local rows cols
+        rows=$(tput lines 2>/dev/null || echo 24)
+        cols=$(tput cols 2>/dev/null || echo 80)
+        echo "$rows $cols"
+    fi
+}
+
+########################################
+# UI Primitives
+########################################
+clear_scr()  { [ -t 1 ] && printf '\033[2J\033[H'; }
+hide_cursor(){ [ -t 1 ] && printf '\033[?25l'; }
+show_cursor(){ [ -t 1 ] && printf '\033[?25h\033[0m'; }
+hr()         { printf '─%.0s' $(seq 1 "${1:-80}"); echo; }
+
+########################################
+# Platform: List interfaces
+########################################
+list_ifaces() {
+    if is_linux; then
+        sed -n '/^[a-zA-Z0-9 _:-]*:/p' /proc/net/dev 2>/dev/null \
+            | cut -d: -f1 | tr -d ' '
+    elif is_mac; then
+        # Use ifconfig -l for a clean list
+        ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -v '^$'
+    fi
+}
+
+########################################
+# Platform: Interface stats
+# Output: "iface rx_bytes tx_bytes [rx_packets tx_packets]"
+########################################
+iface_stats() {
+    local iface="$1"
+    if is_linux; then
+        local line
+        line=$(grep -m1 "^[[:space:]]*${iface}:" /proc/net/dev 2>/dev/null)
+        [ -z "$line" ] && return
+        set -- $line
+        echo "$iface ${2:-0} ${10:-0}"
+    elif is_mac; then
+        # Use netstat -I -b for byte counts
+        local data
+        data=$(netstat -I "$iface" -b -n 2>/dev/null | awk 'NR==2 {print $7, $10}')
+        [ -z "$data" ] && return
+        echo "$iface $data"
+    fi
+}
+
+########################################
+# Platform: All interfaces stats (Linux)
+########################################
+all_iface_stats_linux() {
+    [ ! -f /proc/net/dev ] && return
+    sed -n '/^[a-zA-Z0-9 _:-]*:/p' /proc/net/dev 2>/dev/null \
+        | while read line; do
+            set -- $line
+            local iface="${1%:}"
+            [ "$iface" = "lo" ] && continue
+            echo "$iface ${2:-0} ${10:-0}"
+        done
+}
+
+########################################
+# Platform: All interfaces stats (macOS)
+########################################
+all_iface_stats_mac() {
+    list_ifaces | while IFS= read -r iface; do
+        [ "$iface" = "lo0" ] && continue
+        local data
+        data=$(netstat -I "$iface" -b -n 2>/dev/null | awk 'NR==2 {print $7, $10}')
+        [ -n "$data" ] && echo "$iface $data"
+    done
+}
+
+########################################
+# Platform: All interfaces stats (portable)
+########################################
+all_iface_stats() {
+    if is_linux; then
+        all_iface_stats_linux
+    elif is_mac; then
+        all_iface_stats_mac
+    fi
+}
+
+########################################
+# Platform: Connection stats summary
+########################################
+conn_stats() {
+    local tcp_est=0 tcp_listen=0 udp=0
+    if is_linux; then
+        [ -f /proc/net/tcp ] && {
+            tcp_est=$(awk 'NR>1 && $4=="0x01"{c++} END{print c+0}' /proc/net/tcp 2>/dev/null)
+            tcp_listen=$(awk 'NR>1 && $4=="0x0A"{c++} END{print c+0}' /proc/net/tcp 2>/dev/null)
+        }
+        [ -f /proc/net/udp ] && {
+            udp=$(awk 'NR>1{c++} END{print c+0}' /proc/net/udp 2>/dev/null)
+        }
+    elif is_mac; then
+        tcp_est=$(netstat -a -n -p TCP 2>/dev/null | awk '$6=="ESTABLISHED"{c++} END{print c+0}')
+        tcp_listen=$(netstat -a -n -p TCP 2>/dev/null | awk '$6=="LISTEN"{c++} END{print c+0}')
+        udp=$(netstat -a -n -p UDP 2>/dev/null | awk 'NR>1{c++} END{print c+0}')
+    fi
+    echo "$tcp_est $tcp_listen $udp"
+}
+
+########################################
+# Platform: Active connections
+# Output: "laddr raddr proto total_bytes"
+########################################
+top_connections() {
+    local max="${1:-$MAX_ROWS}"
+    local tmp="$TMP_DIR/conns.tmp"
+    > "$tmp"
+
+    if is_linux; then
+        # Parse /proc/net/tcp and /proc/net/udp (hex little-endian IP)
+        {
+            # TCP established connections
+            awk 'NR>1 && $4=="0x01" {
+                split($2, la, ":"); split($3, ra, ":");
+                lip = sprintf("%d.%d.%d.%d", "0x" substr(la[1],7,2), "0x" substr(la[1],5,2), "0x" substr(la[1],3,2), "0x" substr(la[1],1,2));
+                rip = sprintf("%d.%d.%d.%d", "0x" substr(ra[1],7,2), "0x" substr(ra[1],5,2), "0x" substr(ra[1],3,2), "0x" substr(ra[1],1,2));
+                printf "%s:%d %s:%d tcp %d\n", lip, "0x" la[2], rip, "0x" ra[2], $6+$7
+            }' /proc/net/tcp /proc/net/udp 2>/dev/null
+        } >> "$tmp"
+    elif is_mac; then
+        # macOS: $4=LocalAddress, $5=ForeignAddress, $6=State
+        # IPv4: "IP.port"; IPv6: "IPv6.port" (port has leading dot)
+        netstat -a -n -p TCP 2>/dev/null | awk 'NR>1 && $6=="ESTABLISHED" && $4!~/^[\*]/{ 
+            n=split($4, la, /\./)
+            if ($4 ~ /:/) {
+                for (i=length($4); i>0; i--) { if (substr($4,i,1)==":") break }
+                lp=substr($4,i+1); if (substr(lp,1,1)==".") lp=substr(lp,2)
+                li=substr($4,1,i-1)
+            } else {
+                lp=la[n]; li=la[1]; for(i=2;i<n;i++) li=li"."la[i]
+            }
+            n=split($5, ra, /\./)
+            if ($5 ~ /:/) {
+                for (i=length($5); i>0; i--) { if (substr($5,i,1)==":") break }
+                rp=ra[n]; if (length(rp)==0) { rp=substr($5,i+1); if (substr(rp,1,1)==".") rp=substr(rp,2) }
+                ri=substr($5,1,i-1)
+            } else {
+                rp=ra[n]; ri=ra[1]; for(i=2;i<n;i++) ri=ri"."ra[i]
+            }
+            if (li != "" && ri != "") printf "%s:%s %s:%s tcp 0\n", li,lp,ri,rp
+        }' >> "$tmp"
+        # UDP (listening sockets)
+        netstat -a -n -p UDP 2>/dev/null | awk 'NR>1 && $4!~/^Local/ && $4!~/^\*/ {
+            n=split($4, la, /\./)
+            if ($4 ~ /:/) {
+                for (i=length($4); i>0; i--) { if (substr($4,i,1)==":") break }
+                lp=substr($4,i+1); if (substr(lp,1,1)==".") lp=substr(lp,2)
+                li=substr($4,1,i-1)
+            } else {
+                lp=la[n]; li=la[1]; for(i=2;i<n;i++) li=li"."la[i]
+            }
+            n=split($5, ra, /\./)
+            if ($5 ~ /:/) {
+                for (i=length($5); i>0; i--) { if (substr($5,i,1)==":") break }
+                rp=substr($5,i+1); if (substr(rp,1,1)==".") rp=substr(rp,2)
+                ri=substr($5,1,i-1)
+            } else {
+                rp=ra[n]; ri=ra[1]; for(i=2;i<n;i++) ri=ri"."ra[i]
+            }
+            if (li != "") printf "%s:%s %s:%s udp 0\n", li,lp,ri,rp
+        }' >> "$tmp"
+    fi
+
+    sort -t' ' -k5 -rn "$tmp" 2>/dev/null | head -1000
+    rm -f "$tmp"
+}
+
+########################################
+# State: Save interface stats
+########################################
+save_state() {
+    local iface="$1" rx="$2" tx="$3"
+    # Only keep the latest entry per interface
+    grep -v " $iface $" "$STATE_FILE" 2>/dev/null > "$STATE_FILE.tmp"
+    echo "$(ts) $iface $rx $tx" >> "$STATE_FILE.tmp" 2>/dev/null
+    mv "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
+}
+
+########################################
+# State: Load previous stats
+########################################
+load_prev() {
+    local iface="$1"
+    grep " $iface $" "$STATE_FILE" 2>/dev/null | tail -1 \
+        | awk '{print $4" "$5}'
+}
+
+########################################
+# Delta calculation (handles counter wraps)
+########################################
+delta() {
+    local curr="$1" prev="$2"
+    local diff=$((curr - prev))
+    [ "$diff" -lt 0 ] && diff=$curr
+    echo "$diff"
+}
+
+########################################
+# Display: Main header
+########################################
+disp_header() {
+    local hostname; hostname=$(hostname 2>/dev/null || echo "host")
+    local now; now=$(ts)
+    local uptime; uptime=$(uptime 2>/dev/null | sed 's/.*up /up /' | cut -d, -f1 || echo "")
+
+    clear_scr
+    echo -e "${BOLD}${MAGENTA}╭──────────────────────────────────────────────────────────────────────╮${NC}"
+    printf "${BOLD}${MAGENTA}│${NC}  ${BOLD}nettop${NC} v${VERSION} — Network Traffic Monitor          ${DIM}%s${NC}\n" "$hostname"
+    printf "${BOLD}${MAGENTA}│${NC}  ${DIM}%s  |  %s${NC}\n" "$now" "${uptime:--}"
+    echo -e "${BOLD}${MAGENTA}╰──────────────────────────────────────────────────────────────────────╯${NC}"
+    echo
+}
+
+########################################
+# Display: Summary bar
+########################################
+disp_summary() {
+    local total_rx="$1" total_tx="$2" elapsed="${3:-1}"
+    echo -e "  ${BOLD}Total bandwidth${NC}"
+    echo -en "  ${CYAN}↓ RX:${NC} "; color_rate $(( total_rx / (elapsed > 0 ? elapsed : 1) ))
+    echo -en "  ${CYAN}↑ TX:${NC} "; color_rate $(( total_tx / (elapsed > 0 ? elapsed : 1) ))
+    echo -e "  ${DIM}▲ cumulative: $(fmt_bytes $total_rx) | TX $(fmt_bytes $total_tx)${NC}"
+    echo
+}
+
+########################################
+# Display: Connection summary
+########################################
+disp_conn_stats() {
+    local est="$1" listen="$2" udp="$3"
+    echo -e "  ${BOLD}Connections${NC}"
+    printf "  ${GREEN}%-8s${NC} ${CYAN}%-8s${NC} ${DIM}%-8s${NC}\n" \
+        "EST:$est" "LISTEN:$listen" "UDP:$udp"
+    echo
+}
+
+########################################
+# Display: Interface table
+########################################
+disp_iface_table() {
+    local rows cols; read rows cols < <(tty_size)
+    [ "$cols" -lt 60 ] && cols=80
+
+    local W0=12 W1=12 W2=12 W3=12 W4=12
+    printf "  ${BOLD}%-${W0}s  %-${W1}s  %-${W2}s  %-${W3}s  %s${NC}\n" \
+        "INTERFACE" "RX/s" "TX/s" "TOTAL_RX" "TOTAL_TX"
+    printf "  "; hr $((cols - 2))
+
+    # Collect sorted data
+    local data_file="$TMP_DIR/ifdata.$$"
+    > "$data_file"
+
+    all_iface_stats | while IFS=' ' read -r iface rx tx; do
+        [ -z "$iface" ] && continue
+        local prev_rx prev_tx
+        read prev_rx prev_tx < <(load_prev "$iface")
+        prev_rx=${prev_rx:-0}; prev_tx=${prev_tx:-0}
+
+        local drx dtx
+        drx=$(delta "$rx" "$prev_rx")
+        dtx=$(delta "$tx" "$prev_tx")
+
+        save_state "$iface" "$rx" "$tx"
+
+        # Skip zero-activity interfaces after first run (unless they're interesting)
+        [ "$drx" = "0" ] && [ "$dtx" = "0" ] && continue
+
+        local drx_fmt tx_fmt
+        drx_fmt="$(fmt_rate $drx)"; tx_fmt="$(fmt_rate $dtx)"
+        local total_rx total_tx
+        total_rx="$(fmt_bytes $rx)"; total_tx="$(fmt_bytes $tx)"
+
+        echo "$iface|$drx_fmt|$tx_fmt|$total_rx|$total_tx|$drx" >> "$data_file"
+    done
+
+    # Sort by chosen key
+    local sort_key="${SORT_BY:-rx}"
+    if [ "$sort_key" = "rx" ]; then
+        sort -t'|' -k6 -rn "$data_file" 2>/dev/null
+    else
+        sort -t'|' -k6 -rn "$data_file" 2>/dev/null  # same sort for now
+    fi | head -10 | while IFS='|' read -r iface drx tx rx tx2 drx_raw; do
+        local c="$GREEN"
+        [ "$drx_raw" -gt 1048576 ] 2>/dev/null && c="$RED"
+        [ "$drx_raw" -gt 102400 ]   2>/dev/null && c="$YELLOW"
+        printf "  ${c}%-${W0}s${NC}  %-${W1}s  %-${W2}s  %-${W3}s  %s\n" \
+            "$iface" "$drx" "$tx" "$rx" "$tx2"
+    done
+
+    rm -f "$data_file"
+    echo
+}
+
+########################################
+# Display: Footer
+########################################
+disp_footer() {
+    echo -e "  ${DIM}Controls:${NC} ${ITALIC}q/Q=quit${NC}  ${ITALIC}r=reverse-sort${NC}  ${ITALIC}c=connections${NC}  ${DIM}Refresh: ${REFRESH}s${NC}"
+    echo -e "  ${DIM}nettop v${VERSION} | Ctrl+C to exit${NC}"
+}
+
+########################################
+# Command: Watch (real-time TUI)
+########################################
+cmd_watch() {
+    hide_cursor
+    local prev_ts now_ts elapsed=1
+    prev_ts=$(date +%s)
+
+    while true; do
+        now_ts=$(date +%s)
+        elapsed=$((now_ts - prev_ts))
+        [ "$elapsed" -le 0 ] && elapsed=1
+        prev_ts="$now_ts"
+
+        # Aggregate totals
+        local total_rx=0 total_tx=0
+        while IFS=' ' read -r iface rx tx; do
+            [ -z "$iface" ] && continue
+            local prev_rx prev_tx
+            read prev_rx prev_tx < <(load_prev "$iface")
+            prev_rx=${prev_rx:-0}; prev_tx=${prev_tx:-0}
+            total_rx=$((total_rx + $(delta "$rx" "$prev_rx")))
+            total_tx=$((total_tx + $(delta "$tx" "$prev_tx")))
+        done < <(all_iface_stats)
+
+        # Connection stats
+        local est listen udp
+        read est listen udp < <(conn_stats)
+
+        # Display
+        disp_header
+        disp_summary "$total_rx" "$total_tx" "$elapsed"
+        disp_conn_stats "${est:-0}" "${listen:-0}" "${udp:-0}"
+        disp_iface_table
+        disp_footer
+
+        # Wait with keyboard check
+        local count=0
+        while [ "$count" -lt "$REFRESH" ]; do
+            if read -t 1 -n 1 -s key 2>/dev/null; then
+                case "$key" in
+                    q|Q) show_cursor; echo; info "Goodbye!"; return 0 ;;
+                    r|R) SORT_BY=$([ "$SORT_BY" = "rx" ] && echo "tx" || echo "rx") ;;
+                esac
+            fi
+            count=$((count + 1))
+        done
+    done
+}
+
+########################################
+# Command: Top interfaces
+########################################
+cmd_top() {
+    local max="${1:-$MAX_ROWS}"
+    local cols; cols=$(tty_size | awk '{print $2}')
+    [ "$cols" -lt 60 ] && cols=80
+
+    echo -e "${BOLD}${MAGENTA}╭─────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${BOLD}${MAGENTA}│${NC}  ${BOLD}nettop top${NC} — Top $max interfaces by RX"
+    echo -e "${BOLD}${MAGENTA}╰─────────────────────────────────────────────────────────╯${NC}"
+    echo
+
+    local W0=12 W1=12 W2=12 W3=12 W4=12
+    printf "  ${BOLD}%-${W0}s  %-${W1}s  %-${W2}s  %-${W3}s  %s${NC}\n" \
+        "INTERFACE" "RX/s" "TX/s" "TOTAL_RX" "TOTAL_TX"
+    printf "  "; hr $((cols - 2))
+
+    local data_file="$TMP_DIR/topdata.$$"
+    > "$data_file"
+
+    all_iface_stats | while IFS=' ' read -r iface rx tx; do
+        [ -z "$iface" ] && continue
+        local prev_rx prev_tx
+        read prev_rx prev_tx < <(load_prev "$iface")
+        prev_rx=${prev_rx:-0}; prev_tx=${prev_tx:-0}
+        local drx dtx
+        drx=$(delta "$rx" "$prev_rx")
+        dtx=$(delta "$tx" "$prev_tx")
+        save_state "$iface" "$rx" "$tx"
+        echo "$iface|$(fmt_rate $drx)|$(fmt_rate $dtx)|$(fmt_bytes $rx)|$(fmt_bytes $tx)|$drx" >> "$data_file"
+    done
+
+    local rank=1
+    sort -t'|' -k6 -rn "$data_file" 2>/dev/null | head -"$max" | while IFS='|' read -r iface drx tx rx tx2 _; do
+        printf "  ${CYAN}%2d.${NC} %-${W0}s  %-${W1}s  %-${W2}s  %-${W3}s  %s\n" \
+            "$rank" "$iface" "$drx" "$tx" "$rx" "$tx2"
+        rank=$((rank+1))
+    done
+
+    rm -f "$data_file"
+    echo
+}
+
+########################################
+# Command: List interfaces
+########################################
+cmd_interfaces() {
+    echo -e "${BOLD}${MAGENTA}╭─────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${BOLD}${MAGENTA}│${NC}  ${BOLD}nettop interfaces${NC} — All network interfaces"
+    echo -e "${BOLD}${MAGENTA}╰─────────────────────────────────────────────────────────╯${NC}"
+    echo
+
+    local cols; cols=$(tty_size | awk '{print $2}')
+    [ "$cols" -lt 60 ] && cols=80
+    local W0=12 W1=10 W2=8 W3=20
+
+    printf "  ${BOLD}%-${W0}s  %-${W1}s  %-${W2}s  %s${NC}\n" \
+        "INTERFACE" "STATUS" "MTU" "ADDR"
+    printf "  "; hr $((cols - 2))
+
+    list_ifaces | sort -u | while IFS= read -r iface; do
+        [ -z "$iface" ] && continue
+
+        local status="up" mtu="?" addr="?"
+
+        if is_linux; then
+            ip link show "$iface" 2>/dev/null | grep -q "UP" || status="down"
+            [ -r "/sys/class/net/$iface/mtu" ] && mtu=$(cat "/sys/class/net/$iface/mtu")
+            [ -r "/sys/class/net/$iface/address" ] && addr=$(cat "/sys/class/net/$iface/address")
+        elif is_mac; then
+            local ifout; ifout=$(ifconfig "$iface" 2>/dev/null)
+            echo "$ifout" | grep -q "status: active" || status="down"
+            mtu=$(echo "$ifout" | grep 'mtu' | awk '{print $NF}')
+            addr=$(echo "$ifout" | grep 'ether' | awk '{print $2}')
+        fi
+
+        local s_color
+        case "$status" in
+            up)   s_color="$GREEN" ;;
+            down) s_color="$RED" ;;
+            *)    s_color="$YELLOW" ;;
+        esac
+
+        printf "  ${s_color}%-${W0}s${NC}  %-${W1}s  %-${W2}s  %s\n" \
+            "$iface" "$status" "${mtu:-?}" "${addr:-?}"
+    done
+    echo
+}
+
+########################################
+# Command: Connections
+########################################
+cmd_connections() {
+    local max="${1:-$MAX_ROWS}"
+    echo -e "${BOLD}${MAGENTA}╭─────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${BOLD}${MAGENTA}│${NC}  ${BOLD}nettop connections${NC} — Active connections (top $max)"
+    echo -e "${BOLD}${MAGENTA}╰─────────────────────────────────────────────────────────╯${NC}"
+    echo
+
+    local W0=24 W1=24 W2=6 W3=12
+    printf "  ${BOLD}%-${W0}s  %-${W1}s  %-${W2}s  %s${NC}\n" \
+        "LOCAL" "REMOTE" "PROTO" "TOTAL"
+    printf "  "; hr 70
+
+    local count=0
+    while IFS=' ' read -r la ra proto total _; do
+        [ -z "$la" ] && continue
+        count=$((count+1))
+        [ "$count" -gt "$max" ] && break
+        local total_fmt; total_fmt="$(fmt_bytes ${total:-0})"
+        printf "  %-${W0}s  %-${W1}s  ${CYAN}%-${W2}s${NC}  %s\n" \
+            "$(trunc "$la" $((W0-1)))" \
+            "$(trunc "$ra" $((W1-1)))" \
+            "$proto" "$total_fmt"
+    done < <(top_connections "$max")
+
+    [ "$count" = "0" ] && echo "  No active connections found."
+    echo
+}
+
+########################################
+# Command: Help
+########################################
+cmd_help() {
+    cat << 'HELP'
+
+nettop — Real-time Network Traffic Monitor v1.0.0
+
+USAGE
+    nettop <command> [options]
+
+COMMANDS
+    watch            Real-time TUI monitoring (default)
+    top [N]          Show top N bandwidth interfaces (default: 10)
+    interfaces       List all network interfaces
+    connections [N]  Show top N active connections (default: 10)
+    help             Show this help
+
+OPTIONS (environment variables)
+    NETTOP_REFRESH   Refresh interval in seconds (default: 2)
+    NETTOP_MAX_ROWS  Max rows in top/connections view (default: 10)
+    NETTOP_SORT      Sort order: rx | tx (default: rx)
+    NETTOP_COLOR     Enable colors: 0 | 1 (default: 1)
+    NETTOP_BINARY    Use binary units (1024): 0 | 1 (default: 0)
+
+KEYBOARD SHORTCUTS (watch mode)
+    q / Q            Quit
+    r / R            Toggle sort order (rx ↔ tx)
+
+EXAMPLES
+    ./bin/nettop.sh watch
+
+    NETTOP_SORT=rx ./bin/nettop.sh top 20
+    NETTOP_REFRESH=1 ./bin/nettop.sh watch
+    NETTOP_BINARY=1 ./bin/nettop.sh watch
+    ./bin/nettop.sh connections 30
+
+REQUIREMENTS
+    Bash 3.2+, Linux (procfs) or macOS
+    Optional: bc, awk, sort
+
+HELP
+}
+
+########################################
+# Main
+########################################
+main() {
+    _setup_colors
+    _init
+
+    local cmd="${1:-watch}"
+    shift 2>/dev/null
+
+    case "$cmd" in
+        watch)          cmd_watch "$@" ;;
+        top)            cmd_top "$@" ;;
+        interfaces)     cmd_interfaces "$@" ;;
+        connections)    cmd_connections "$@" ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            error "Unknown command: $cmd"
+            echo "Run 'nettop help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
