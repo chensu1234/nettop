@@ -1,0 +1,10 @@
+# State and runtime files
+.state/
+log/*.log
+
+# macOS
+.DS_Store
+
+# Backup files
+*.bak
+*~
